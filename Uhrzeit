@@ -1,0 +1,157 @@
+#include <Arduino.h>
+
+#include <Arduino.h>
+#include <FastLED.h>
+#include <WiFi.h>
+#include "time.h"
+
+// WLAN-Daten
+const char* ssid     = "Sandroooo";
+const char* password = "123456789";
+
+// NTP-Server
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600;      // MEZ = +1h
+const int   daylightOffset_sec = 3600; // Sommerzeit
+
+// Matrix-Definition
+#define LED_PIN_1   26
+#define LED_PIN_2   25
+#define WIDTH       32
+#define HEIGHT      8
+#define NUM_LEDS    (WIDTH * HEIGHT)
+#define COLOR_ORDER GRB
+#define CHIPSET     WS2812
+#define BRIGHTNESS  25
+
+CRGB leds1[NUM_LEDS];
+CRGB leds2[NUM_LEDS];
+
+// Font (5x7 für Ziffern, :, ., Leerzeichen)
+const uint8_t font5x7[][5] = {
+  {0x3E,0x45,0x49,0x51,0x3E}, // 0
+  {0x00,0x21,0x7F,0x01,0x00}, // 1
+  {0x21,0x43,0x45,0x49,0x31}, // 2
+  {0x42,0x41,0x51,0x69,0x46}, // 3
+  {0x0C,0x14,0x24,0x7F,0x04}, // 4
+  {0x72,0x51,0x51,0x51,0x4E}, // 5
+  {0x1E,0x29,0x49,0x49,0x06}, // 6
+  {0x40,0x47,0x48,0x50,0x60}, // 7
+  {0x36,0x49,0x49,0x49,0x36}, // 8
+  {0x30,0x49,0x49,0x4A,0x3C}, // 9
+  {0x00,0x36,0x36,0x00,0x00}, // :
+  {0x00,0x06,0x06,0x00,0x00}, // .
+  {0x00,0x00,0x00,0x00,0x00}  // ' '
+};
+
+// Matrix-Funktion
+uint16_t XY_matrix(uint8_t x, uint8_t y) {
+  if (x >= WIDTH || y >= HEIGHT) return 0;
+  uint8_t realX = WIDTH - 1 - x;
+  uint8_t realY = y;
+  uint16_t index;
+  if (realX % 2 == 0) {
+    index = (realX * HEIGHT) + realY;
+  } else {
+    index = (realX * HEIGHT) + (HEIGHT - 1 - realY);
+  }
+  return index;
+}
+
+void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
+  if (y < HEIGHT) {
+    leds1[XY_matrix(x, y)] = color;
+  } else if (y < 2 * HEIGHT) {
+    uint8_t y_rel = y - HEIGHT;
+    uint8_t y_flipped = HEIGHT - 1 - y_rel;
+    uint8_t x_flipped = WIDTH - 1 - x;
+    leds2[XY_matrix(x_flipped, y_flipped)] = color;
+  }
+}
+
+// Zeichen normal zeichnen
+void drawChar(int16_t x, int16_t y, const uint8_t *chr, CRGB color) {
+  for (uint8_t col = 0; col < 5; col++) {
+    uint8_t line = chr[col];
+    for (uint8_t row = 0; row < 7; row++) {
+      if (line & (1 << row)) {
+        int16_t px = x + col;
+        setPixelXY(px, y + (6 - row), color);
+      }
+    }
+  }
+}
+
+const uint8_t* getGlyph(char c) {
+  if (c >= '0' && c <= '9') return font5x7[c - '0'];
+  if (c == ':') return font5x7[10];
+  if (c == '.') return font5x7[11];
+  if (c == ' ') return font5x7[12];
+  return font5x7[12]; // fallback: Leerzeichen
+}
+
+// Textbreite berechnen
+int textWidth(const char *text) {
+  int len = 0;
+  for (uint8_t i = 0; text[i] != '\0'; i++) {
+    len += 6; // 5 Pixel + 1 Abstand
+  }
+  return len;
+}
+
+// Text komplett gespiegelt um Y-Achse innerhalb der Matrix zeichnen
+void drawTextMirrored(int16_t x, int16_t y, const char *text, CRGB color) {
+  int16_t cursorX = x;
+  for (uint8_t i = 0; text[i] != '\0'; i++) {
+    const uint8_t *glyph = getGlyph(text[i]);
+    for (uint8_t col = 0; col < 5; col++) {
+      uint8_t line = glyph[col];
+      for (uint8_t row = 0; row < 7; row++) {
+        if (line & (1 << row)) {
+          // Spiegelung innerhalb der Matrixbreite
+          int16_t px = WIDTH - 1 - (cursorX + col);
+          setPixelXY(px, y + (6 - row), color);
+        }
+      }
+    }
+    cursorX += 6;
+  }
+}
+
+// Setup
+void setup() {
+  FastLED.addLeds<CHIPSET, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
+  FastLED.addLeds<CHIPSET, LED_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+}
+
+// Loop: Laufschrift gespiegelt mit dynamischer Breite
+void loop() {
+  static int16_t offset = WIDTH; // Start rechts außerhalb
+  FastLED.clear();
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buffer[20];
+    strftime(buffer, sizeof(buffer), "%d.%m.%Y %H:%M", &timeinfo);
+
+    int tw = textWidth(buffer);   // Breite des Textes
+    drawTextMirrored(offset, 0, buffer, CRGB::Green);
+
+    FastLED.show();
+    delay(100);
+
+    offset--; // nach links verschieben
+    if (offset < -tw) {           // erst zurücksetzen, wenn GANZER Text raus ist
+      offset = WIDTH;
+    }
+  }
+}
