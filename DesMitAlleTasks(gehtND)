@@ -249,7 +249,7 @@ static WeatherData   gWeather;
 static volatile bool gParticlesInit = false;
 static volatile int  gLabelScrollX  = MATRIX_WIDTH;
 
-void connectWiFi() {
+bool connectWiFi() {
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
@@ -809,10 +809,18 @@ void setup() {
   xLedMutex     = xSemaphoreCreateMutex();
   xJoyQueue     = xQueueCreate(8, sizeof(JoyEvent_t));
 
-  connectWiFi();
+  if(!connectWiFi());
+    Serial.println("WiFi Verbindung fehlgeschlagen!");
+
   fetchWeather();
 
-
+  // Boot-Animation: Regenbogen-Sweep
+  for (int i = 0; i < 256; i += 4) {
+    for (int x = 0; x < MATRIX_WIDTH; x++)
+      for (int y = 0; y < MATRIX_HEIGHT; y++)
+        setPixelXY(x, y, CHSV(i + x * 8, 255, 255));
+    FastLED.show();
+    delay(10);
   }
   FastLED.clear();
   FastLED.show();
