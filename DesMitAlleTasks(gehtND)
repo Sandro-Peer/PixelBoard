@@ -1,0 +1,838 @@
+/**
+ * =====================================================
+ * LED-Matrix Menü-System mit FreeRTOS
+ * BUGFIX-VERSION
+ * =====================================================
+ * FIX 1: JSON-Fehlerprüfung korrigiert (!error statt !doc)
+ * FIX 2: XY-Mapping für beide Matrizen vereinheitlicht
+ * FIX 3: Untere Matrix Spiegelung korrigiert
+ * FIX 4: FastLED Race Condition – xLedMutex konsequent überall
+ * FIX 5: loop() durch vTaskSuspend ersetzt (nie löschen!)
+ * FIX 6: Scroll-Task prüft gMenuState vor Zugriff
+ * =====================================================
+ */
+
+#include <Arduino.h>
+#include <FastLED.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+// =====================================================
+// HARDWARE CONFIG
+// =====================================================
+#define LED_PIN_1     26
+#define LED_PIN_2     25
+#define WIDTH         32
+#define HEIGHT        8
+#define NUM_LEDS      (WIDTH * HEIGHT)
+#define COLOR_ORDER   GRB
+#define CHIPSET       WS2812
+#define BRIGHTNESS    80
+#define MATRIX_WIDTH  32
+#define MATRIX_HEIGHT 16  // beide Matrizen übereinander
+
+// Joystick
+#define JOY_X_PIN     34
+#define JOY_Y_PIN     35
+#define JOY_BTN_PIN   32
+#define JOY_CENTER    2048
+#define JOY_DEADZONE  500
+#define JOY_THRESHOLD 1200
+
+// =====================================================
+// WIFI & API
+// =====================================================
+const char* ssid     = "Sandroooo";
+const char* password = "123456789";
+const char* apiKey   = "d7b76766f6710c883e714461869f44bd";
+const char* city     = "Vienna";
+
+// =====================================================
+// MENÜ-SYSTEM
+// =====================================================
+typedef enum { MENU_MAIN=0, MENU_WEATHER, MENU_CLOCK, MENU_SNAKE } MenuState_t;
+typedef enum { JOY_NONE=0, JOY_LEFT, JOY_RIGHT, JOY_UP, JOY_DOWN, JOY_PRESS } JoyEvent_t;
+
+static volatile MenuState_t gMenuState = MENU_MAIN;
+
+QueueHandle_t     xJoyQueue;
+SemaphoreHandle_t xLedMutex;      // schützt leds1[], leds2[], FastLED.show()
+SemaphoreHandle_t xWeatherMutex;  // schützt gWeather
+
+TaskHandle_t hTaskMenu    = NULL;
+TaskHandle_t hTaskDisplay = NULL;
+TaskHandle_t hTaskWeather = NULL;
+TaskHandle_t hTaskScroll  = NULL;
+
+// =====================================================
+// LED BUFFER
+// =====================================================
+CRGB leds1[NUM_LEDS];
+CRGB leds2[NUM_LEDS];
+
+// =====================================================
+// FIX 2 & 3: XY-MAPPING – beide Matrizen korrekt
+// =====================================================
+// Obere Matrix (leds1): y = 0..7
+// Untere Matrix (leds2): y = 8..15, physisch NICHT gespiegelt
+//   → leds2 ist baugleich zu leds1, aber um 180° gedreht montiert
+//   → daher x UND y invertieren
+uint16_t XY_matrix(uint8_t x, uint8_t y) {
+  // Nur für eine einzelne 32×8-Matrix aufgerufen (y immer 0..7)
+  if (x >= WIDTH || y >= HEIGHT) return 0;
+  uint8_t realX = WIDTH - 1 - x;
+  // Serpentinen-Verdrahtung: gerade Spalten top→bottom, ungerade bottom→top
+  if (realX % 2 == 0) return (realX * HEIGHT) + y;
+  else                 return (realX * HEIGHT) + (HEIGHT - 1 - y);
+}
+
+void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
+  if (x >= MATRIX_WIDTH) return;
+
+  if (y < HEIGHT) {
+    // Obere Matrix – direkt
+    leds1[XY_matrix(x, y)] = color;
+
+  } else if (y < MATRIX_HEIGHT) {
+    // FIX 3: Untere Matrix ist 180° gedreht montiert
+    // → x von rechts, y innerhalb der unteren Matrix von unten zählen
+    uint8_t localY = y - HEIGHT;               // 0..7 innerhalb leds2
+    uint8_t mappedX = WIDTH  - 1 - x;          // X spiegeln
+    uint8_t mappedY = HEIGHT - 1 - localY;     // Y spiegeln
+    leds2[XY_matrix(mappedX, mappedY)] = color;
+  }
+}
+
+void clearLeds() {
+  // Kein Mutex hier – Aufrufer hält bereits xLedMutex
+  memset(leds1, 0, sizeof(leds1));
+  memset(leds2, 0, sizeof(leds2));
+}
+
+// =====================================================
+// FONTS
+// =====================================================
+const uint8_t FONT_LARGE[][7] = {
+  {0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110}, // 0
+  {0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110}, // 1
+  {0b01110,0b10001,0b00001,0b00110,0b01000,0b10000,0b11111}, // 2
+  {0b11111,0b00001,0b00010,0b00110,0b00001,0b10001,0b01110}, // 3
+  {0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010}, // 4
+  {0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110}, // 5
+  {0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110}, // 6
+  {0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000}, // 7
+  {0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110}, // 8
+  {0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100}, // 9
+  {0b00100,0b01010,0b00100,0b00000,0b00000,0b00000,0b00000}, // 10=°
+  {0b01110,0b10000,0b10000,0b10000,0b10000,0b10000,0b01110}, // 11=C
+  {0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000}, // 12=-
+};
+
+const uint8_t FONT_SM[][5] = {
+  {0b010,0b111,0b101,0b101,0b010}, // a=0
+  {0b110,0b101,0b110,0b101,0b110}, // b=1
+  {0b011,0b100,0b100,0b100,0b011}, // c=2
+  {0b110,0b101,0b101,0b101,0b110}, // d=3
+  {0b111,0b100,0b111,0b100,0b111}, // e=4
+  {0b111,0b100,0b110,0b100,0b100}, // f=5
+  {0b011,0b100,0b101,0b101,0b011}, // g=6
+  {0b101,0b101,0b111,0b101,0b101}, // h=7
+  {0b111,0b010,0b010,0b010,0b111}, // i=8
+  {0b011,0b001,0b001,0b101,0b010}, // j=9
+  {0b101,0b110,0b100,0b110,0b101}, // k=10
+  {0b100,0b100,0b100,0b100,0b111}, // l=11
+  {0b101,0b111,0b101,0b101,0b101}, // m=12
+  {0b110,0b101,0b101,0b101,0b101}, // n=13
+  {0b010,0b101,0b101,0b101,0b010}, // o=14
+  {0b110,0b101,0b110,0b100,0b100}, // p=15
+  {0b010,0b101,0b101,0b011,0b001}, // q=16
+  {0b110,0b101,0b110,0b101,0b101}, // r=17
+  {0b011,0b100,0b010,0b001,0b110}, // s=18
+  {0b111,0b010,0b010,0b010,0b010}, // t=19
+  {0b101,0b101,0b101,0b101,0b011}, // u=20
+  {0b101,0b101,0b101,0b010,0b010}, // v=21
+  {0b101,0b101,0b101,0b111,0b101}, // w=22
+  {0b101,0b010,0b010,0b010,0b101}, // x=23
+  {0b101,0b101,0b010,0b010,0b010}, // y=24
+  {0b111,0b001,0b010,0b100,0b111}, // z=25
+  {0b000,0b000,0b000,0b000,0b000}, // 26=Leer
+  {0b000,0b000,0b111,0b000,0b000}, // 27=-
+};
+
+// Zeichenfunktionen – dürfen nur aufgerufen werden, wenn Aufrufer xLedMutex hält
+void drawLargeChar(int x_off, int y_off, uint8_t idx, CRGB color) {
+  if (idx > 12) return;
+  for (int row = 0; row < 7; row++) {
+    uint8_t bits = FONT_LARGE[idx][row];
+    for (int col = 0; col < 5; col++) {
+      if (!(bits & (1 << (4 - col)))) continue;
+      // FIX 2: kein manuelles X-Spiegeln hier – setPixelXY übernimmt das Mapping
+      int gx = x_off + col;
+      int gy = y_off + row;
+      if (gx < 0 || gx >= MATRIX_WIDTH || gy < 0 || gy >= MATRIX_HEIGHT) continue;
+      setPixelXY(gx, gy, color);
+    }
+  }
+}
+
+void drawSmallChar(int x_off, int y_off, uint8_t idx, CRGB color) {
+  if (idx > 27) return;
+  for (int row = 0; row < 5; row++) {
+    uint8_t bits = FONT_SM[idx][row];
+    for (int col = 0; col < 3; col++) {
+      if (!(bits & (1 << (2 - col)))) continue;
+      int gx = x_off + col;
+      int gy = y_off + row;
+      if (gx < 0 || gx >= MATRIX_WIDTH || gy < 0 || gy >= MATRIX_HEIGHT) continue;
+      setPixelXY(gx, gy, color);
+    }
+  }
+}
+
+void drawSmallString(int x_off, int y_off, const char* str, CRGB color) {
+  for (int i = 0; str[i] != '\0'; i++) {
+    char c = str[i];
+    uint8_t idx = (c >= 'a' && c <= 'z') ? (uint8_t)(c - 'a')
+                : (c == ' ') ? 26 : (c == '-') ? 27 : 26;
+    drawSmallChar(x_off + i * 4, y_off, idx, color);
+  }
+}
+
+// =====================================================
+// MENÜ-ICONS (8×8)
+// =====================================================
+const uint8_t ICON_WEATHER[8][8] = {
+  {0,0,0,0,0,0,0,0},
+  {0,0,1,1,0,0,0,0},
+  {0,1,0,0,1,0,0,0},
+  {0,1,0,0,0,1,1,0},
+  {0,1,1,1,1,1,1,0},
+  {0,0,0,0,0,0,0,0},
+  {0,1,0,1,0,1,0,0},
+  {0,0,0,0,0,0,0,0},
+};
+const uint8_t ICON_CLOCK[8][8] = {
+  {0,0,1,1,1,1,0,0},
+  {0,1,0,0,0,0,1,0},
+  {0,1,0,0,1,0,1,0},
+  {0,1,0,0,1,0,1,0},
+  {0,1,0,1,1,0,1,0},
+  {0,1,0,0,0,0,1,0},
+  {0,0,1,1,1,1,0,0},
+  {0,0,0,0,0,0,0,0},
+};
+const uint8_t ICON_SNAKE[8][8] = {
+  {0,0,0,0,0,0,0,0},
+  {0,0,1,1,1,0,0,0},
+  {0,0,1,0,0,0,0,0},
+  {0,0,1,1,1,0,0,0},
+  {0,0,0,0,1,0,0,0},
+  {0,0,1,1,1,0,0,0},
+  {0,0,0,0,0,1,0,0},
+  {0,0,0,0,0,0,0,0},
+};
+
+// =====================================================
+// WETTER – Daten
+// =====================================================
+struct WeatherData {
+  float  temp      = 16.0f;
+  int    condition = 800;
+  String label     = "sonnig";
+};
+static WeatherData   gWeather;
+static volatile bool gParticlesInit = false;
+static volatile int  gLabelScrollX  = MATRIX_WIDTH;
+
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    tries++;
+  }
+}
+
+String conditionToLabel(int code) {
+  if (code >= 200 && code < 300) return "gewitter";
+  if (code >= 300 && code < 400) return "niesel";
+  if (code >= 500 && code < 600) return "regen";
+  if (code >= 600 && code < 700) return "schnee";
+  if (code >= 700 && code < 800) return "nebel";
+  if (code == 800)               return "sonnig";
+  if (code == 801)               return "leicht";
+  if (code == 802)               return "wolkig";
+  if (code >= 803)               return "bedeckt";
+  return "unbekannt";
+}
+
+// FIX 1: Korrekte JSON-Fehlerprüfung mit DeserializationError
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) return; // kein WiFi → abbrechen
+
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(city)
+             + "&appid=" + String(apiKey) + "&units=metric&lang=de";
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);  // FIX 1
+
+    if (!error) {  // FIX 1: error prüfen, nicht doc
+      WeatherData wd;
+      wd.temp      = doc["main"]["temp"].as<float>();
+      wd.condition = doc["weather"][0]["id"].as<int>();
+      wd.label     = conditionToLabel(wd.condition);
+
+      if (xSemaphoreTake(xWeatherMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        gWeather       = wd;
+        gParticlesInit = false;
+        xSemaphoreGive(xWeatherMutex);
+      }
+    } else {
+      Serial.printf("[Weather] JSON Fehler: %s\n", error.c_str());
+    }
+  } else {
+    Serial.printf("[Weather] HTTP Fehler: %d\n", httpCode);
+  }
+  http.end();
+}
+
+// =====================================================
+// WETTER – Partikel & Render
+// (nur aufrufen wenn xLedMutex gehalten wird)
+// =====================================================
+struct Particle { float x, y, speed; };
+static Particle particles[20];
+
+void initParticles() {
+  for (int i = 0; i < 20; i++)
+    particles[i] = { (float)random(0, MATRIX_WIDTH),
+                     (float)random(0, MATRIX_HEIGHT * 100) / 100.0f,
+                     random(10, 40) / 100.0f };
+}
+
+void drawBackground(int condition) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    leds1[i].fadeToBlackBy(50);
+    leds2[i].fadeToBlackBy(50);
+  }
+
+  if (condition >= 300 && condition < 600) {
+    static TickType_t last = 0;
+    if (xTaskGetTickCount() - last > pdMS_TO_TICKS(60)) {
+      last = xTaskGetTickCount();
+      for (int i = 0; i < 20; i++) {
+        particles[i].y += particles[i].speed * 4;
+        if (particles[i].y >= MATRIX_HEIGHT) { particles[i].y = 0; particles[i].x = random(0, MATRIX_WIDTH); }
+        setPixelXY((int)particles[i].x, (int)particles[i].y, CRGB(20, 60, 220));
+      }
+    }
+  } else if (condition >= 600 && condition < 700) {
+    static TickType_t last = 0;
+    if (xTaskGetTickCount() - last > pdMS_TO_TICKS(130)) {
+      last = xTaskGetTickCount();
+      for (int i = 0; i < 20; i++) {
+        particles[i].y += particles[i].speed * 1.2f;
+        if (particles[i].y >= MATRIX_HEIGHT) { particles[i].y = 0; particles[i].x = random(0, MATRIX_WIDTH); }
+        uint8_t b = 180 + random(0, 50);
+        setPixelXY((int)particles[i].x, (int)particles[i].y, CRGB(b, b, b));
+      }
+    }
+  } else if (condition == 800) {
+    static TickType_t last = 0;
+    if (xTaskGetTickCount() - last > pdMS_TO_TICKS(100)) {
+      last = xTaskGetTickCount();
+      for (int i = 0; i < 20; i++) {
+        particles[i].y += particles[i].speed;
+        if (particles[i].y >= MATRIX_HEIGHT) { particles[i].y = 0; particles[i].x = random(0, MATRIX_WIDTH); }
+        setPixelXY((int)particles[i].x, (int)particles[i].y, CHSV(35, 220, 130));
+      }
+    }
+  } else if (condition > 800) {
+    static TickType_t last = 0; static int cx = 0;
+    if (xTaskGetTickCount() - last > pdMS_TO_TICKS(180)) { last = xTaskGetTickCount(); cx = (cx + 1) % MATRIX_WIDTH; }
+    int pts[][2] = {{0,0},{1,0},{2,0},{3,0},{-1,0},{0,-1},{1,-1},{2,-1},{0,1},{1,1},{2,1}};
+    for (auto& p : pts) {
+      setPixelXY((cx + p[0] + MATRIX_WIDTH) % MATRIX_WIDTH, constrain(4  + p[1], 0, 7),  CRGB(55,55,55));
+      setPixelXY((cx + p[0] + MATRIX_WIDTH) % MATRIX_WIDTH, constrain(11 + p[1], 8, 15), CRGB(55,55,55));
+    }
+  } else if (condition >= 200 && condition < 300) {
+    static TickType_t lastBolt = 0, boltStart = 0;
+    static bool boltOn = false; static int bx = 16;
+    if (!boltOn && xTaskGetTickCount() - lastBolt > pdMS_TO_TICKS(random(800, 2500))) {
+      boltOn = true; bx = random(3, MATRIX_WIDTH - 3); boltStart = lastBolt = xTaskGetTickCount();
+    }
+    if (boltOn) {
+      int x = bx;
+      for (int y = 0; y < MATRIX_HEIGHT; y++) {
+        setPixelXY(x, y, CRGB(220, 220, 80));
+        if (y % 3 == 1) x += random(-1, 2);
+        x = constrain(x, 0, MATRIX_WIDTH - 1);
+      }
+      if (xTaskGetTickCount() - boltStart > pdMS_TO_TICKS(80)) boltOn = false;
+    }
+  } else if (condition >= 700 && condition < 800) {
+    static uint32_t t = 0; t += 2;
+    for (int x = 0; x < MATRIX_WIDTH; x++)
+      for (int y = 0; y < MATRIX_HEIGHT; y++) {
+        uint8_t n = inoise8(x * 30, y * 30, t);
+        uint8_t b = map(n, 0, 255, 8, 45);
+        setPixelXY(x, y, CRGB(b, b, b + 10));
+      }
+  }
+}
+
+void drawTemperature(float temp) {
+  uint8_t chars[6]; int len = 0;
+  int t = (int)round(temp);
+  if (t < 0) { chars[len++] = 12; t = -t; }
+  if (t >= 10) chars[len++] = t / 10;
+  chars[len++] = t % 10; chars[len++] = 10; chars[len++] = 11;
+  CRGB col;
+  if      (temp <= 0)  col = CRGB(80,  160, 255);
+  else if (temp <= 10) col = CRGB(0,   200, 255);
+  else if (temp <= 20) col = CRGB(0,   220,  80);
+  else if (temp <= 30) col = CRGB(255, 200,   0);
+  else                 col = CRGB(255,  60,   0);
+  int totalW = len * 6 - 1;
+  int startX = (MATRIX_WIDTH - totalW) / 2;
+  int startY = (MATRIX_HEIGHT - 7) / 2;
+  for (int i = 0; i < len; i++) drawLargeChar(startX + i * 6, startY, chars[i], col);
+}
+
+void drawWeatherLabel(const String& label, int scrollX) {
+  String lbl = label; lbl.toLowerCase();
+  for (int i = 0; i < (int)lbl.length(); i++) {
+    char c = lbl[i];
+    uint8_t idx = (c >= 'a' && c <= 'z') ? (uint8_t)(c - 'a')
+                : (c == ' ') ? 26 : (c == '-') ? 27 : 26;
+    int xPos = scrollX + i * 4;
+    if (xPos >= MATRIX_WIDTH || xPos < -3) continue;
+    drawSmallChar(xPos, 10, idx, CRGB(0, 140, 255));
+  }
+}
+
+// =====================================================
+// SNAKE – Daten & Logik
+// =====================================================
+#define MAX_SNAKE_LENGTH 150
+struct Point { int x; int y; };
+
+static Point   snakeBody[MAX_SNAKE_LENGTH];
+static int     snakeLength;
+static int     snakeDirX,     snakeDirY;
+static int     snakeLastDirX, snakeLastDirY;
+static Point   snakeFood;
+static int     snakeSpeed;
+static uint8_t snakeHue;
+
+static const int SNAKE_BASE_SPEED = 200;
+static const int SNAKE_MIN_SPEED  = 80;
+
+void snakeSpawnFood() {
+  bool valid = false;
+  while (!valid) {
+    snakeFood.x = random(0, MATRIX_WIDTH);
+    snakeFood.y = random(0, MATRIX_HEIGHT);
+    valid = true;
+    for (int i = 0; i < snakeLength; i++)
+      if (snakeBody[i].x == snakeFood.x && snakeBody[i].y == snakeFood.y) { valid = false; break; }
+  }
+}
+
+void snakeReset() {
+  snakeLength   = 3;
+  snakeBody[0]  = {16, 8}; snakeBody[1] = {15, 8}; snakeBody[2] = {14, 8};
+  snakeDirX     = 1;  snakeDirY     = 0;
+  snakeLastDirX = 1;  snakeLastDirY = 0;
+  snakeSpeed    = SNAKE_BASE_SPEED;
+  snakeHue      = 0;
+  snakeSpawnFood();
+}
+
+bool snakeCheckCollision(int x, int y) {
+  if (x < 0 || x >= MATRIX_WIDTH || y < 0 || y >= MATRIX_HEIGHT) return true;
+  for (int i = 1; i < snakeLength; i++)
+    if (snakeBody[i].x == x && snakeBody[i].y == y) return true;
+  return false;
+}
+
+void snakeReadJoystick() {
+  int dx = analogRead(JOY_X_PIN) - JOY_CENTER;
+  int dy = analogRead(JOY_Y_PIN) - JOY_CENTER;
+  if (abs(dx) < JOY_DEADZONE && abs(dy) < JOY_DEADZONE) return;
+  if (abs(dx) > abs(dy)) {
+    if (dx < -JOY_THRESHOLD && snakeLastDirX !=  1) { snakeDirX = -1; snakeDirY =  0; }
+    else if (dx >  JOY_THRESHOLD && snakeLastDirX != -1) { snakeDirX =  1; snakeDirY =  0; }
+  } else {
+    if (dy < -JOY_THRESHOLD && snakeLastDirY != -1) { snakeDirX =  0; snakeDirY =  1; }
+    else if (dy >  JOY_THRESHOLD && snakeLastDirY !=  1) { snakeDirX =  0; snakeDirY = -1; }
+  }
+}
+
+// Nur aufrufen wenn xLedMutex gehalten wird
+void snakeDraw() {
+  clearLeds();
+  for (int i = 0; i < snakeLength; i++) {
+    uint8_t hue = snakeHue + (i * 255 / snakeLength);
+    if (i == 0)
+      setPixelXY(snakeBody[i].x, snakeBody[i].y, CHSV(hue, 200, 255));
+    else {
+      uint8_t brightness = 255 - (i * 100 / snakeLength);
+      setPixelXY(snakeBody[i].x, snakeBody[i].y, CHSV(hue, 255, brightness));
+    }
+  }
+  setPixelXY(snakeFood.x, snakeFood.y, CHSV(0, 255, beatsin8(60, 100, 255)));
+}
+
+// =====================================================
+// TASK: INPUT – Core 0 | Prio 4
+// =====================================================
+void vTaskInput(void* pvParameters) {
+  pinMode(JOY_BTN_PIN, INPUT_PULLUP);
+  bool lastBtn = HIGH; bool joyMoved = false; TickType_t lastRepeat = 0;
+
+  for (;;) {
+    int  rawX   = analogRead(JOY_X_PIN);
+    int  rawY   = analogRead(JOY_Y_PIN);
+    bool btnNow = digitalRead(JOY_BTN_PIN);
+    int  dx     = rawX - JOY_CENTER;
+    int  dy     = rawY - JOY_CENTER;
+
+    JoyEvent_t ev = JOY_NONE;
+    if (abs(dx) > abs(dy)) {
+      if      (dx >  JOY_THRESHOLD) ev = JOY_RIGHT;
+      else if (dx < -JOY_THRESHOLD) ev = JOY_LEFT;
+    } else {
+      if      (dy >  JOY_THRESHOLD) ev = JOY_DOWN;
+      else if (dy < -JOY_THRESHOLD) ev = JOY_UP;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (ev != JOY_NONE) {
+      if (!joyMoved || (now - lastRepeat > pdMS_TO_TICKS(300))) {
+        xQueueSend(xJoyQueue, &ev, 0);
+        joyMoved = true; lastRepeat = now;
+      }
+    } else {
+      joyMoved = false;
+    }
+
+    if (btnNow == LOW && lastBtn == HIGH) {
+      JoyEvent_t press = JOY_PRESS;
+      xQueueSend(xJoyQueue, &press, 0);
+      vTaskDelay(pdMS_TO_TICKS(50)); // Entprellung
+    }
+    lastBtn = btnNow;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// =====================================================
+// TASK: WEATHER FETCH – Core 0 | Prio 1
+// =====================================================
+void vTaskWeatherFetch(void* pvParameters) {
+  for (;;) {
+    fetchWeather();
+    vTaskDelay(pdMS_TO_TICKS(600000UL)); // alle 10 min
+  }
+}
+
+// =====================================================
+// TASK: WEATHER SCROLL – Core 0 | Prio 2
+// FIX 6: prüft gMenuState – kein Scroll-Update wenn Wetter nicht aktiv
+// =====================================================
+void vTaskWeatherScroll(void* pvParameters) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(75));
+
+    // FIX 6: Nur scrollen wenn Wetter-Ansicht aktiv
+    if (gMenuState != MENU_WEATHER) continue;
+
+    int labelLen = 0;
+    if (xSemaphoreTake(xWeatherMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      labelLen = gWeather.label.length();
+      xSemaphoreGive(xWeatherMutex);
+    }
+
+    // FIX 6: Kein Update wenn Label leer (würde zu sofortigem Reset führen)
+    if (labelLen == 0) continue;
+
+    gLabelScrollX--;
+    if (gLabelScrollX < -(labelLen * 4))
+      gLabelScrollX = MATRIX_WIDTH;
+  }
+}
+
+// =====================================================
+// TASK: WEATHER DISPLAY – Core 1 | Prio 3
+// FIX 4: xLedMutex bei JEDEM FastLED-Zugriff
+// =====================================================
+void vTaskWeatherDisplay(void* pvParameters) {
+  for (;;) {
+    JoyEvent_t ev;
+    if (xQueueReceive(xJoyQueue, &ev, 0) == pdTRUE && ev == JOY_PRESS) {
+      // Wetter-Hilfstasks sauber stoppen
+      if (hTaskWeather) { vTaskDelete(hTaskWeather); hTaskWeather = NULL; }
+      if (hTaskScroll)  { vTaskDelete(hTaskScroll);  hTaskScroll  = NULL; }
+      gMenuState   = MENU_MAIN;
+      hTaskDisplay = NULL;
+      vTaskDelete(NULL);
+      return;
+    }
+
+    WeatherData wd;
+    bool needInit = false;
+    if (xSemaphoreTake(xWeatherMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      wd = gWeather;
+      if (!gParticlesInit) { needInit = true; gParticlesInit = true; }
+      xSemaphoreGive(xWeatherMutex);
+    }
+    if (needInit) initParticles();
+
+    // FIX 4: Mutex vor JEDEM Schreiben in LED-Buffer + show()
+    if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+      drawBackground(wd.condition);
+      drawTemperature(wd.temp);
+      drawWeatherLabel(wd.label, gLabelScrollX);
+      FastLED.show();
+      xSemaphoreGive(xLedMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// =====================================================
+// TASK: CLOCK DISPLAY – Core 1 | Prio 3 (Platzhalter)
+// =====================================================
+void vTaskClockDisplay(void* pvParameters) {
+  for (;;) {
+    JoyEvent_t ev;
+    if (xQueueReceive(xJoyQueue, &ev, 0) == pdTRUE && ev == JOY_PRESS) {
+      gMenuState = MENU_MAIN; hTaskDisplay = NULL;
+      vTaskDelete(NULL); return;
+    }
+    if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+      clearLeds();
+      // TODO: NTP/RTC Uhrzeit einbauen
+      drawSmallString(4, 6, "uhr", CRGB(0, 200, 255));
+      FastLED.show();
+      xSemaphoreGive(xLedMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// =====================================================
+// TASK: SNAKE – Core 1 | Prio 3
+// FIX 4: xLedMutex konsequent bei allen LED-Zugriffen
+// =====================================================
+void vTaskSnake(void* pvParameters) {
+  snakeReset();
+
+  // Startblink-Animation
+  for (int i = 0; i < 3; i++) {
+    if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+      clearLeds(); FastLED.show(); xSemaphoreGive(xLedMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+      for (int j = 0; j < snakeLength; j++)
+        setPixelXY(snakeBody[j].x, snakeBody[j].y, CRGB::Blue);
+      setPixelXY(snakeFood.x, snakeFood.y, CRGB::Red);
+      FastLED.show(); xSemaphoreGive(xLedMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+
+  TickType_t lastMove = xTaskGetTickCount();
+
+  for (;;) {
+    // Zurück-Button
+    JoyEvent_t ev;
+    if (xQueueReceive(xJoyQueue, &ev, 0) == pdTRUE && ev == JOY_PRESS) {
+      gMenuState = MENU_MAIN; hTaskDisplay = NULL;
+      vTaskDelete(NULL); return;
+    }
+
+    snakeReadJoystick();
+
+    if (xTaskGetTickCount() - lastMove >= pdMS_TO_TICKS(snakeSpeed)) {
+      lastMove = xTaskGetTickCount();
+
+      int newX = snakeBody[0].x + snakeDirX;
+      int newY = snakeBody[0].y + snakeDirY;
+
+      if (snakeCheckCollision(newX, newY)) {
+        // Tod-Animation
+        for (int i = 0; i < 3; i++) {
+          if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+            for (int j = 0; j < snakeLength; j++)
+              setPixelXY(snakeBody[j].x, snakeBody[j].y, CRGB::Red);
+            FastLED.show(); xSemaphoreGive(xLedMutex);
+          }
+          vTaskDelay(pdMS_TO_TICKS(150));
+          if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+            clearLeds(); FastLED.show(); xSemaphoreGive(xLedMutex);
+          }
+          vTaskDelay(pdMS_TO_TICKS(150));
+        }
+        snakeReset(); lastMove = xTaskGetTickCount(); continue;
+      }
+
+      // Snake verschieben
+      for (int i = snakeLength; i > 0; i--) snakeBody[i] = snakeBody[i - 1];
+      snakeBody[0]  = {newX, newY};
+      snakeLastDirX = snakeDirX;
+      snakeLastDirY = snakeDirY;
+
+      // Essen einsammeln
+      if (newX == snakeFood.x && newY == snakeFood.y) {
+        if (snakeLength < MAX_SNAKE_LENGTH) {
+          snakeLength++;
+          snakeSpeed = max(SNAKE_MIN_SPEED, SNAKE_BASE_SPEED - (snakeLength * 3));
+          // FIX 4: Mutex auch beim Food-Blitz korrekt freigeben
+          if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+            for (int f = 0; f < 5; f++) {
+              setPixelXY(snakeFood.x, snakeFood.y, CHSV(random(0, 255), 255, 255));
+              FastLED.show();
+              xSemaphoreGive(xLedMutex);
+              vTaskDelay(pdMS_TO_TICKS(30)); // delay AUSSERHALB des Mutex!
+              xSemaphoreTake(xLedMutex, portMAX_DELAY);
+            }
+            xSemaphoreGive(xLedMutex);
+          }
+        }
+        snakeSpawnFood();
+      }
+
+      if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
+        snakeDraw(); snakeHue++;
+        FastLED.show(); xSemaphoreGive(xLedMutex);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// =====================================================
+// HAUPT-MENÜ – Render
+// (nur aufrufen wenn xLedMutex gehalten wird)
+// =====================================================
+#define MENU_ITEMS 3
+static const uint8_t (*MENU_ICONS[MENU_ITEMS])[8] = { ICON_WEATHER, ICON_CLOCK, ICON_SNAKE };
+static const CRGB MENU_COLORS[MENU_ITEMS] = {
+  CRGB(0, 160, 255), CRGB(255, 200, 0), CRGB(0, 220, 60)
+};
+static const MenuState_t MENU_TARGETS[MENU_ITEMS] = { MENU_WEATHER, MENU_CLOCK, MENU_SNAKE };
+
+void renderMainMenu(int selected) {
+  clearLeds();
+  for (int i = 0; i < MENU_ITEMS; i++) {
+    int  xPos   = 4 + i * 9;
+    bool active = (i == selected);
+    CRGB col    = active ? MENU_COLORS[i] : MENU_COLORS[i].scale8(55);
+    for (int row = 0; row < 8; row++)
+      for (int c = 0; c < 8; c++)
+        if (MENU_ICONS[i][row][c]) setPixelXY(xPos + c, row, col);
+    if (active) {
+      setPixelXY(xPos + 3,  9, col); setPixelXY(xPos + 4,  9, col);
+      setPixelXY(xPos + 3, 10, col); setPixelXY(xPos + 4, 10, col);
+    }
+  }
+}
+
+// =====================================================
+// TASK: HAUPT-MENÜ – Core 0 | Prio 3
+// =====================================================
+void vTaskMainMenu(void* pvParameters) {
+  int selected = 0;
+  for (;;) {
+    if (gMenuState != MENU_MAIN) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+
+    JoyEvent_t ev;
+    if (xQueueReceive(xJoyQueue, &ev, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (ev == JOY_LEFT)  selected = (selected - 1 + MENU_ITEMS) % MENU_ITEMS;
+      if (ev == JOY_RIGHT) selected = (selected + 1) % MENU_ITEMS;
+      if (ev == JOY_PRESS) {
+        gMenuState = MENU_TARGETS[selected];
+        switch (gMenuState) {
+          case MENU_WEATHER:
+            gLabelScrollX  = MATRIX_WIDTH;
+            gParticlesInit = false;
+            xTaskCreatePinnedToCore(vTaskWeatherFetch,   "WFetch",  8192, NULL, 1, &hTaskWeather, 0);
+            xTaskCreatePinnedToCore(vTaskWeatherScroll,  "WScroll", 2048, NULL, 2, &hTaskScroll,  0);
+            xTaskCreatePinnedToCore(vTaskWeatherDisplay, "WDisp",   4096, NULL, 3, &hTaskDisplay, 1);
+            break;
+          case MENU_CLOCK:
+            xTaskCreatePinnedToCore(vTaskClockDisplay, "Clock", 3072, NULL, 3, &hTaskDisplay, 1);
+            break;
+          case MENU_SNAKE:
+            xTaskCreatePinnedToCore(vTaskSnake, "Snake", 4096, NULL, 3, &hTaskDisplay, 1);
+            break;
+          default: break;
+        }
+      }
+    }
+
+    if (xSemaphoreTake(xLedMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+      renderMainMenu(selected);
+      FastLED.show();
+      xSemaphoreGive(xLedMutex);
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  FastLED.addLeds<CHIPSET, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
+  FastLED.addLeds<CHIPSET, LED_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+
+  xWeatherMutex = xSemaphoreCreateMutex();
+  xLedMutex     = xSemaphoreCreateMutex();
+  xJoyQueue     = xQueueCreate(8, sizeof(JoyEvent_t));
+
+  connectWiFi();
+  fetchWeather();
+
+
+  }
+  FastLED.clear();
+  FastLED.show();
+  delay(300);
+
+  // ─────────────────────────────────────────────────
+  //  Task           | Stack | Prio | Core
+  //  vTaskInput     |  2048 |  4   |  0   Joystick
+  //  vTaskMainMenu  |  4096 |  3   |  0   Menü-Logik
+  //  Untermenü-Tasks werden dynamisch gestartet/gestoppt
+  // ─────────────────────────────────────────────────
+  xTaskCreatePinnedToCore(vTaskInput,    "Input", 2048, NULL, 4, NULL,       0);
+  xTaskCreatePinnedToCore(vTaskMainMenu, "Menu",  4096, NULL, 3, &hTaskMenu, 0);
+}
+
+// =====================================================
+// FIX 5: loop() NIEMALS löschen – vTaskSuspend stattdessen
+// vTaskDelete(NULL) auf dem Arduino-Loop-Task kann den
+// FreeRTOS-Idle-Task destabilisieren → Watchdog-Reset
+// =====================================================
+void loop() {
+  vTaskSuspend(NULL); // Arduino-Loop-Task schlafen legen, nicht löschen
+}
