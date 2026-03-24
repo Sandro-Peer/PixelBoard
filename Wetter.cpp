@@ -3,7 +3,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-
+ 
 #define LED_PIN_1     26
 #define LED_PIN_2     25
 #define WIDTH         32
@@ -14,21 +14,21 @@
 #define BRIGHTNESS    80
 #define MATRIX_WIDTH  32
 #define MATRIX_HEIGHT 16
-
+ 
 CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
-
+ 
 const char* ssid     = "Sandroooo";
 const char* password = "123456789";
 const char* apiKey   = "d7b76766f6710c883e714461869f44bd";
 const char* city     = "Innsbruck";   // FIX: Stadtname gesetzt
-
+ 
 float  weatherTemp      = 16.0;
 int    weatherCondition = 800;
 String weatherLabel     = "sonnig";
 unsigned long lastWeatherFetch = 0;
 #define WEATHER_INTERVAL 600000UL
-
+ 
 // =====================================================
 // MATRIX MAPPING
 // =====================================================
@@ -38,7 +38,7 @@ uint16_t XY_matrix(uint8_t x, uint8_t y) {
   if (realX % 2 == 0) return (realX * HEIGHT) + y;
   else                 return (realX * HEIGHT) + (HEIGHT - 1 - y);
 }
-
+ 
 void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
   if (y < HEIGHT)
     leds1[XY_matrix(x, y)] = color;
@@ -48,7 +48,7 @@ void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
     leds2[XY_matrix(x_flipped, y_flipped)] = color;
   }
 }
-
+ 
 // =====================================================
 // WLAN & WETTER
 // =====================================================
@@ -58,7 +58,7 @@ void connectWiFi() {
     delay(500);
   }
 }
-
+ 
 String conditionToLabel(int code) {
   if (code >= 200 && code < 300) return "gewitter";
   if (code >= 300 && code < 400) return "niesel";
@@ -71,7 +71,7 @@ String conditionToLabel(int code) {
   if (code >= 803)               return "bedeckt";
   return "unbekannt";
 }
-
+ 
 void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
   HTTPClient http;
@@ -90,7 +90,7 @@ void fetchWeather() {
   }
   http.end();
 }
-
+ 
 // =====================================================
 // FONTS
 // =====================================================
@@ -109,7 +109,7 @@ const uint8_t FONT_LARGE[][7] = {
   {0b01110,0b10000,0b10000,0b10000,0b10000,0b10000,0b01110}, // C
   {0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000}, // -
 };
-
+ 
 const uint8_t FONT_SM[][5] = {
   {0b010,0b111,0b101,0b101,0b010}, // a
   {0b110,0b101,0b110,0b101,0b110}, // b
@@ -140,7 +140,7 @@ const uint8_t FONT_SM[][5] = {
   {0b000,0b000,0b000,0b000,0b000}, // space
   {0b000,0b000,0b111,0b000,0b000}, // -
 };
-
+ 
 // =====================================================
 // ZEICHNEN
 // =====================================================
@@ -157,7 +157,7 @@ void drawLargeChar(int x_off, int y_off, uint8_t idx, CRGB color) {
     }
   }
 }
-
+ 
 void drawSmallChar(int x_off, int y_off, uint8_t idx, CRGB color) {
   if (idx > 27) return;
   for (int row = 0; row < 5; row++) {
@@ -171,7 +171,7 @@ void drawSmallChar(int x_off, int y_off, uint8_t idx, CRGB color) {
     }
   }
 }
-
+ 
 // =====================================================
 // TEMPERATUR
 // =====================================================
@@ -183,24 +183,24 @@ void drawTemperature() {
   chars[len++] = t % 10;
   chars[len++] = 10; // °
   chars[len++] = 11; // C
-
+ 
   CRGB col = CRGB(255, 255, 255);  // gut sichtbar
-
+ 
   int totalW = len * 6 - 1;
   int startX = (MATRIX_WIDTH - totalW) / 2;
   int startY = 3; // etwas höher, damit unten Platz für Text bleibt
-
+ 
   for (int i = 0; i < len; i++)
     drawLargeChar(startX + i * 6, startY, chars[i], col);
 }
-
+ 
 // =====================================================
 // WETTERTEXT
 // =====================================================
 int labelScrollX = MATRIX_WIDTH;
 unsigned long lastLabelStep = 0;
 #define LABEL_STEP_MS 75
-
+ 
 void updateLabelScroll() {
   if (millis() - lastLabelStep < LABEL_STEP_MS) return;
   lastLabelStep = millis();
@@ -208,7 +208,7 @@ void updateLabelScroll() {
   if (labelScrollX < -(int)(weatherLabel.length() * 4))
     labelScrollX = MATRIX_WIDTH;
 }
-
+ 
 void drawWeatherLabel() {
   String lbl = weatherLabel;
   lbl.toLowerCase();
@@ -218,18 +218,18 @@ void drawWeatherLabel() {
                 : (c == ' ')             ? 26
                 : (c == '-')             ? 27 : 26;
     int xPos = labelScrollX + i * 4;
-    if (xPos > MATRIX_WIDTH || xPos < -3) continue;
-    drawSmallChar(xPos, 11, idx, CRGB(0, 140, 255)); // unten auf der zweiten Matrix
+    //if (xPos > MATRIX_WIDTH || xPos < -3) continue;
+    //drawSmallChar(xPos, 11, idx, CRGB(0, 140, 255)); // unten auf der zweiten Matrix
   }
 }
-
+ 
 // =====================================================
 // HINTERGRUND
 // =====================================================
 struct Particle { float x; float y; float speed; };
 Particle particles[20];
 bool particlesInit = false;
-
+ 
 void initParticles() {
   for (int i = 0; i < 20; i++) {
     particles[i] = { (float)random(0, MATRIX_WIDTH),
@@ -238,13 +238,13 @@ void initParticles() {
   }
   particlesInit = true;
 }
-
+ 
 void drawBackground() {
   for (int i = 0; i < NUM_LEDS; i++) {
     leds1[i].fadeToBlackBy(40);
     leds2[i].fadeToBlackBy(40);
   }
-
+ 
   // Regen
   if (weatherCondition >= 300 && weatherCondition < 600) {
     if (!particlesInit) initParticles();
@@ -324,7 +324,7 @@ void drawBackground() {
     }
   }
 }
-
+ 
 // =====================================================
 // SETUP
 // =====================================================
@@ -335,7 +335,7 @@ void setup() {
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.clear();
   FastLED.show();
-
+ 
   // kleiner Start-Sweep, um zu sehen, ob alles läuft
   for (int i = 0; i < MATRIX_WIDTH; i++) {
     FastLED.clear();
@@ -343,26 +343,26 @@ void setup() {
     FastLED.show();
     delay(20);
   }
-
+ 
   connectWiFi();
   fetchWeather();
   lastWeatherFetch = millis();
   labelScrollX = MATRIX_WIDTH;
 }
-
+ 
 // =====================================================
 // LOOP
 // =====================================================
 void loop() {
   unsigned long now = millis();
-
+ 
   if (now - lastWeatherFetch > WEATHER_INTERVAL) {
     lastWeatherFetch = now;
     fetchWeather();
     particlesInit = false;
     labelScrollX = MATRIX_WIDTH;
   }
-
+ 
   drawBackground();
   drawTemperature();
   updateLabelScroll();
