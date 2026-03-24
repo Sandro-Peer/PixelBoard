@@ -1,14 +1,18 @@
+
 /**
  * =====================================================
  * LED-Matrix Menü-System mit FreeRTOS
- * BUGFIX-VERSION
- * =====================================================
- * FIX 1: JSON-Fehlerprüfung korrigiert (!error statt !doc)
- * FIX 2: XY-Mapping für beide Matrizen vereinheitlicht
+ * FIXES:
+ * FIX 1: JSON-Fehlerprüfung korrigiert
+ * FIX 2: XY-Mapping vereinheitlicht
  * FIX 3: Untere Matrix Spiegelung korrigiert
- * FIX 4: FastLED Race Condition – xLedMutex konsequent überall
- * FIX 5: loop() durch vTaskSuspend ersetzt (nie löschen!)
- * FIX 6: Scroll-Task prüft gMenuState vor Zugriff
+ * FIX 4: FastLED Race Condition – xLedMutex überall
+ * FIX 5: loop() durch vTaskSuspend ersetzt
+ * FIX 6: Scroll-Task prüft gMenuState
+ * FIX 7: WiFi-Semikolon-Bug behoben
+ * FIX 8: connectWiFi() gibt bool zurück
+ * FIX 9: Helligkeit auf 20 reduziert (USB-Strom)
+ * FIX 10: fetchWeather() nicht-blockierend beim Start
  * =====================================================
  */
 
@@ -32,9 +36,9 @@
 #define NUM_LEDS      (WIDTH * HEIGHT)
 #define COLOR_ORDER   GRB
 #define CHIPSET       WS2812
-#define BRIGHTNESS    80
+#define BRIGHTNESS    20    // FIX 9: niedrig für USB-Betrieb, max 80 mit ext. Netzteil
 #define MATRIX_WIDTH  32
-#define MATRIX_HEIGHT 16  // beide Matrizen übereinander
+#define MATRIX_HEIGHT 16
 
 // Joystick
 #define JOY_X_PIN     34
@@ -61,8 +65,8 @@ typedef enum { JOY_NONE=0, JOY_LEFT, JOY_RIGHT, JOY_UP, JOY_DOWN, JOY_PRESS } Jo
 static volatile MenuState_t gMenuState = MENU_MAIN;
 
 QueueHandle_t     xJoyQueue;
-SemaphoreHandle_t xLedMutex;      // schützt leds1[], leds2[], FastLED.show()
-SemaphoreHandle_t xWeatherMutex;  // schützt gWeather
+SemaphoreHandle_t xLedMutex;
+SemaphoreHandle_t xWeatherMutex;
 
 TaskHandle_t hTaskMenu    = NULL;
 TaskHandle_t hTaskDisplay = NULL;
@@ -76,40 +80,28 @@ CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
 
 // =====================================================
-// FIX 2 & 3: XY-MAPPING – beide Matrizen korrekt
+// XY-MAPPING
 // =====================================================
-// Obere Matrix (leds1): y = 0..7
-// Untere Matrix (leds2): y = 8..15, physisch NICHT gespiegelt
-//   → leds2 ist baugleich zu leds1, aber um 180° gedreht montiert
-//   → daher x UND y invertieren
 uint16_t XY_matrix(uint8_t x, uint8_t y) {
-  // Nur für eine einzelne 32×8-Matrix aufgerufen (y immer 0..7)
   if (x >= WIDTH || y >= HEIGHT) return 0;
   uint8_t realX = WIDTH - 1 - x;
-  // Serpentinen-Verdrahtung: gerade Spalten top→bottom, ungerade bottom→top
   if (realX % 2 == 0) return (realX * HEIGHT) + y;
-  else                 return (realX * HEIGHT) + (HEIGHT - 1 - y);
+  else                return (realX * HEIGHT) + (HEIGHT - 1 - y);
 }
 
 void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
   if (x >= MATRIX_WIDTH) return;
-
   if (y < HEIGHT) {
-    // Obere Matrix – direkt
     leds1[XY_matrix(x, y)] = color;
-
   } else if (y < MATRIX_HEIGHT) {
-    // FIX 3: Untere Matrix ist 180° gedreht montiert
-    // → x von rechts, y innerhalb der unteren Matrix von unten zählen
-    uint8_t localY = y - HEIGHT;               // 0..7 innerhalb leds2
-    uint8_t mappedX = WIDTH  - 1 - x;          // X spiegeln
-    uint8_t mappedY = HEIGHT - 1 - localY;     // Y spiegeln
+    uint8_t localY  = y - HEIGHT;
+    uint8_t mappedX = WIDTH  - 1 - x;
+    uint8_t mappedY = HEIGHT - 1 - localY;
     leds2[XY_matrix(mappedX, mappedY)] = color;
   }
 }
 
 void clearLeds() {
-  // Kein Mutex hier – Aufrufer hält bereits xLedMutex
   memset(leds1, 0, sizeof(leds1));
   memset(leds2, 0, sizeof(leds2));
 }
@@ -164,14 +156,12 @@ const uint8_t FONT_SM[][5] = {
   {0b000,0b000,0b111,0b000,0b000}, // 27=-
 };
 
-// Zeichenfunktionen – dürfen nur aufgerufen werden, wenn Aufrufer xLedMutex hält
 void drawLargeChar(int x_off, int y_off, uint8_t idx, CRGB color) {
   if (idx > 12) return;
   for (int row = 0; row < 7; row++) {
     uint8_t bits = FONT_LARGE[idx][row];
     for (int col = 0; col < 5; col++) {
       if (!(bits & (1 << (4 - col)))) continue;
-      // FIX 2: kein manuelles X-Spiegeln hier – setPixelXY übernimmt das Mapping
       int gx = x_off + col;
       int gy = y_off + row;
       if (gx < 0 || gx >= MATRIX_WIDTH || gy < 0 || gy >= MATRIX_HEIGHT) continue;
@@ -249,13 +239,22 @@ static WeatherData   gWeather;
 static volatile bool gParticlesInit = false;
 static volatile int  gLabelScrollX  = MATRIX_WIDTH;
 
+// FIX 7 & 8: connectWiFi gibt bool zurück, kein hängender Aufruf
 bool connectWiFi() {
+  Serial.println("[WiFi] Verbinde...");
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
     tries++;
   }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Verbunden!");
+    return true;
+  }
+  Serial.println("\n[WiFi] Verbindung fehlgeschlagen!");
+  return false;
 }
 
 String conditionToLabel(int code) {
@@ -271,10 +270,10 @@ String conditionToLabel(int code) {
   return "unbekannt";
 }
 
-// FIX 1: Korrekte JSON-Fehlerprüfung mit DeserializationError
 void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) return; // kein WiFi → abbrechen
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!connectWiFi()) return;
+  }
 
   HTTPClient http;
   String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(city)
@@ -285,9 +284,9 @@ void fetchWeather() {
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
     DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, payload);  // FIX 1
+    DeserializationError error = deserializeJson(doc, payload);
 
-    if (!error) {  // FIX 1: error prüfen, nicht doc
+    if (!error) {
       WeatherData wd;
       wd.temp      = doc["main"]["temp"].as<float>();
       wd.condition = doc["weather"][0]["id"].as<int>();
@@ -298,6 +297,7 @@ void fetchWeather() {
         gParticlesInit = false;
         xSemaphoreGive(xWeatherMutex);
       }
+      Serial.printf("[Weather] %.1f°C, %s\n", wd.temp, wd.label.c_str());
     } else {
       Serial.printf("[Weather] JSON Fehler: %s\n", error.c_str());
     }
@@ -309,7 +309,6 @@ void fetchWeather() {
 
 // =====================================================
 // WETTER – Partikel & Render
-// (nur aufrufen wenn xLedMutex gehalten wird)
 // =====================================================
 struct Particle { float x, y, speed; };
 static Particle particles[20];
@@ -423,7 +422,7 @@ void drawWeatherLabel(const String& label, int scrollX) {
 }
 
 // =====================================================
-// SNAKE – Daten & Logik
+// SNAKE
 // =====================================================
 #define MAX_SNAKE_LENGTH 150
 struct Point { int x; int y; };
@@ -480,7 +479,6 @@ void snakeReadJoystick() {
   }
 }
 
-// Nur aufrufen wenn xLedMutex gehalten wird
 void snakeDraw() {
   clearLeds();
   for (int i = 0; i < snakeLength; i++) {
@@ -496,7 +494,7 @@ void snakeDraw() {
 }
 
 // =====================================================
-// TASK: INPUT – Core 0 | Prio 4
+// TASK: INPUT
 // =====================================================
 void vTaskInput(void* pvParameters) {
   pinMode(JOY_BTN_PIN, INPUT_PULLUP);
@@ -531,7 +529,7 @@ void vTaskInput(void* pvParameters) {
     if (btnNow == LOW && lastBtn == HIGH) {
       JoyEvent_t press = JOY_PRESS;
       xQueueSend(xJoyQueue, &press, 0);
-      vTaskDelay(pdMS_TO_TICKS(50)); // Entprellung
+      vTaskDelay(pdMS_TO_TICKS(50));
     }
     lastBtn = btnNow;
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -539,24 +537,21 @@ void vTaskInput(void* pvParameters) {
 }
 
 // =====================================================
-// TASK: WEATHER FETCH – Core 0 | Prio 1
+// TASK: WEATHER FETCH
 // =====================================================
 void vTaskWeatherFetch(void* pvParameters) {
   for (;;) {
     fetchWeather();
-    vTaskDelay(pdMS_TO_TICKS(600000UL)); // alle 10 min
+    vTaskDelay(pdMS_TO_TICKS(600000UL));
   }
 }
 
 // =====================================================
-// TASK: WEATHER SCROLL – Core 0 | Prio 2
-// FIX 6: prüft gMenuState – kein Scroll-Update wenn Wetter nicht aktiv
+// TASK: WEATHER SCROLL
 // =====================================================
 void vTaskWeatherScroll(void* pvParameters) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(75));
-
-    // FIX 6: Nur scrollen wenn Wetter-Ansicht aktiv
     if (gMenuState != MENU_WEATHER) continue;
 
     int labelLen = 0;
@@ -564,8 +559,6 @@ void vTaskWeatherScroll(void* pvParameters) {
       labelLen = gWeather.label.length();
       xSemaphoreGive(xWeatherMutex);
     }
-
-    // FIX 6: Kein Update wenn Label leer (würde zu sofortigem Reset führen)
     if (labelLen == 0) continue;
 
     gLabelScrollX--;
@@ -575,14 +568,12 @@ void vTaskWeatherScroll(void* pvParameters) {
 }
 
 // =====================================================
-// TASK: WEATHER DISPLAY – Core 1 | Prio 3
-// FIX 4: xLedMutex bei JEDEM FastLED-Zugriff
+// TASK: WEATHER DISPLAY
 // =====================================================
 void vTaskWeatherDisplay(void* pvParameters) {
   for (;;) {
     JoyEvent_t ev;
     if (xQueueReceive(xJoyQueue, &ev, 0) == pdTRUE && ev == JOY_PRESS) {
-      // Wetter-Hilfstasks sauber stoppen
       if (hTaskWeather) { vTaskDelete(hTaskWeather); hTaskWeather = NULL; }
       if (hTaskScroll)  { vTaskDelete(hTaskScroll);  hTaskScroll  = NULL; }
       gMenuState   = MENU_MAIN;
@@ -600,7 +591,6 @@ void vTaskWeatherDisplay(void* pvParameters) {
     }
     if (needInit) initParticles();
 
-    // FIX 4: Mutex vor JEDEM Schreiben in LED-Buffer + show()
     if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
       drawBackground(wd.condition);
       drawTemperature(wd.temp);
@@ -613,7 +603,7 @@ void vTaskWeatherDisplay(void* pvParameters) {
 }
 
 // =====================================================
-// TASK: CLOCK DISPLAY – Core 1 | Prio 3 (Platzhalter)
+// TASK: CLOCK DISPLAY
 // =====================================================
 void vTaskClockDisplay(void* pvParameters) {
   for (;;) {
@@ -624,7 +614,6 @@ void vTaskClockDisplay(void* pvParameters) {
     }
     if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
       clearLeds();
-      // TODO: NTP/RTC Uhrzeit einbauen
       drawSmallString(4, 6, "uhr", CRGB(0, 200, 255));
       FastLED.show();
       xSemaphoreGive(xLedMutex);
@@ -634,13 +623,11 @@ void vTaskClockDisplay(void* pvParameters) {
 }
 
 // =====================================================
-// TASK: SNAKE – Core 1 | Prio 3
-// FIX 4: xLedMutex konsequent bei allen LED-Zugriffen
+// TASK: SNAKE
 // =====================================================
 void vTaskSnake(void* pvParameters) {
   snakeReset();
 
-  // Startblink-Animation
   for (int i = 0; i < 3; i++) {
     if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
       clearLeds(); FastLED.show(); xSemaphoreGive(xLedMutex);
@@ -658,7 +645,6 @@ void vTaskSnake(void* pvParameters) {
   TickType_t lastMove = xTaskGetTickCount();
 
   for (;;) {
-    // Zurück-Button
     JoyEvent_t ev;
     if (xQueueReceive(xJoyQueue, &ev, 0) == pdTRUE && ev == JOY_PRESS) {
       gMenuState = MENU_MAIN; hTaskDisplay = NULL;
@@ -674,7 +660,6 @@ void vTaskSnake(void* pvParameters) {
       int newY = snakeBody[0].y + snakeDirY;
 
       if (snakeCheckCollision(newX, newY)) {
-        // Tod-Animation
         for (int i = 0; i < 3; i++) {
           if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
             for (int j = 0; j < snakeLength; j++)
@@ -690,24 +675,21 @@ void vTaskSnake(void* pvParameters) {
         snakeReset(); lastMove = xTaskGetTickCount(); continue;
       }
 
-      // Snake verschieben
       for (int i = snakeLength; i > 0; i--) snakeBody[i] = snakeBody[i - 1];
       snakeBody[0]  = {newX, newY};
       snakeLastDirX = snakeDirX;
       snakeLastDirY = snakeDirY;
 
-      // Essen einsammeln
       if (newX == snakeFood.x && newY == snakeFood.y) {
         if (snakeLength < MAX_SNAKE_LENGTH) {
           snakeLength++;
           snakeSpeed = max(SNAKE_MIN_SPEED, SNAKE_BASE_SPEED - (snakeLength * 3));
-          // FIX 4: Mutex auch beim Food-Blitz korrekt freigeben
           if (xSemaphoreTake(xLedMutex, portMAX_DELAY) == pdTRUE) {
             for (int f = 0; f < 5; f++) {
               setPixelXY(snakeFood.x, snakeFood.y, CHSV(random(0, 255), 255, 255));
               FastLED.show();
               xSemaphoreGive(xLedMutex);
-              vTaskDelay(pdMS_TO_TICKS(30)); // delay AUSSERHALB des Mutex!
+              vTaskDelay(pdMS_TO_TICKS(30));
               xSemaphoreTake(xLedMutex, portMAX_DELAY);
             }
             xSemaphoreGive(xLedMutex);
@@ -726,8 +708,7 @@ void vTaskSnake(void* pvParameters) {
 }
 
 // =====================================================
-// HAUPT-MENÜ – Render
-// (nur aufrufen wenn xLedMutex gehalten wird)
+// HAUPT-MENÜ
 // =====================================================
 #define MENU_ITEMS 3
 static const uint8_t (*MENU_ICONS[MENU_ITEMS])[8] = { ICON_WEATHER, ICON_CLOCK, ICON_SNAKE };
@@ -752,9 +733,6 @@ void renderMainMenu(int selected) {
   }
 }
 
-// =====================================================
-// TASK: HAUPT-MENÜ – Core 0 | Prio 3
-// =====================================================
 void vTaskMainMenu(void* pvParameters) {
   int selected = 0;
   for (;;) {
@@ -798,23 +776,27 @@ void vTaskMainMenu(void* pvParameters) {
 // =====================================================
 void setup() {
   Serial.begin(115200);
+  Serial.println("[Boot] Start...");
 
   FastLED.addLeds<CHIPSET, LED_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
   FastLED.addLeds<CHIPSET, LED_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.clear();
   FastLED.show();
+  Serial.println("[Boot] FastLED OK");
 
   xWeatherMutex = xSemaphoreCreateMutex();
   xLedMutex     = xSemaphoreCreateMutex();
   xJoyQueue     = xQueueCreate(8, sizeof(JoyEvent_t));
+  Serial.println("[Boot] FreeRTOS Objekte OK");
 
-  if(!connectWiFi());
-    Serial.println("WiFi Verbindung fehlgeschlagen!");
-
-  fetchWeather();
+  // FIX 7: WiFi im Hintergrund – blockiert den Start nicht mehr
+  // Wetterdaten werden erst beim Öffnen des Wetter-Menüs geholt
+  Serial.println("[Boot] WiFi wird im Hintergrund verbunden...");
+  WiFi.begin(ssid, password);
 
   // Boot-Animation: Regenbogen-Sweep
+  Serial.println("[Boot] Boot-Animation...");
   for (int i = 0; i < 256; i += 4) {
     for (int x = 0; x < MATRIX_WIDTH; x++)
       for (int y = 0; y < MATRIX_HEIGHT; y++)
@@ -825,22 +807,14 @@ void setup() {
   FastLED.clear();
   FastLED.show();
   delay(300);
+  Serial.println("[Boot] Animation fertig");
 
-  // ─────────────────────────────────────────────────
-  //  Task           | Stack | Prio | Core
-  //  vTaskInput     |  2048 |  4   |  0   Joystick
-  //  vTaskMainMenu  |  4096 |  3   |  0   Menü-Logik
-  //  Untermenü-Tasks werden dynamisch gestartet/gestoppt
-  // ─────────────────────────────────────────────────
   xTaskCreatePinnedToCore(vTaskInput,    "Input", 2048, NULL, 4, NULL,       0);
   xTaskCreatePinnedToCore(vTaskMainMenu, "Menu",  4096, NULL, 3, &hTaskMenu, 0);
+  Serial.println("[Boot] Tasks gestartet – Menü läuft");
 }
 
-// =====================================================
-// FIX 5: loop() NIEMALS löschen – vTaskSuspend stattdessen
-// vTaskDelete(NULL) auf dem Arduino-Loop-Task kann den
-// FreeRTOS-Idle-Task destabilisieren → Watchdog-Reset
-// =====================================================
+// FIX 5: loop() niemals löschen
 void loop() {
-  vTaskSuspend(NULL); // Arduino-Loop-Task schlafen legen, nicht löschen
+  vTaskSuspend(NULL);
 }
