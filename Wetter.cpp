@@ -21,7 +21,7 @@ CRGB leds2[NUM_LEDS];
 const char* ssid     = "Sandroooo";
 const char* password = "123456789";
 const char* apiKey   = "d7b76766f6710c883e714461869f44bd";
-const char* city     = "";
+const char* city     = "Innsbruck";   // FIX: Stadtname gesetzt
 
 float  weatherTemp      = 16.0;
 int    weatherCondition = 800;
@@ -54,7 +54,9 @@ void setPixelXY(uint8_t x, uint8_t y, const CRGB& color) {
 // =====================================================
 void connectWiFi() {
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
 }
 
 String conditionToLabel(int code) {
@@ -80,22 +82,17 @@ void fetchWeather() {
   if (httpCode > 0) {
     DynamicJsonDocument doc(2048);
     DeserializationError error = deserializeJson(doc, http.getString());
-    if (!error) { // Fixed: Properly check for deserialization success
+    if (!error) {
       weatherTemp      = doc["main"]["temp"];
       weatherCondition = doc["weather"][0]["id"];
       weatherLabel     = conditionToLabel(weatherCondition);
-    } else {
-      Serial.println("Failed to parse weather data: " + String(error.c_str()));
     }
-  } else {
-    Serial.println("HTTP GET failed with code: " + String(httpCode));
   }
   http.end();
 }
 
 // =====================================================
-// FONT GROSS 7hoch x 5breit – Temperatur über beide Matrizen
-// Bit 4=links ... Bit 0=rechts
+// FONTS
 // =====================================================
 const uint8_t FONT_LARGE[][7] = {
   {0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110}, // 0
@@ -108,49 +105,45 @@ const uint8_t FONT_LARGE[][7] = {
   {0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000}, // 7
   {0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110}, // 8
   {0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100}, // 9
-  {0b00100,0b01010,0b00100,0b00000,0b00000,0b00000,0b00000}, // 10 = °
-  {0b01110,0b10000,0b10000,0b10000,0b10000,0b10000,0b01110}, // 11 = C
-  {0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000}, // 12 = -
+  {0b00100,0b01010,0b00100,0b00000,0b00000,0b00000,0b00000}, // °
+  {0b01110,0b10000,0b10000,0b10000,0b10000,0b10000,0b01110}, // C
+  {0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000}, // -
 };
 
-// FONT KLEIN 5hoch x 3breit – Wettertext scrollend unten
 const uint8_t FONT_SM[][5] = {
-  {0b010,0b111,0b101,0b101,0b010}, // a=0
-  {0b110,0b101,0b110,0b101,0b110}, // b=1
-  {0b011,0b100,0b100,0b100,0b011}, // c=2
-  {0b110,0b101,0b101,0b101,0b110}, // d=3
-  {0b111,0b100,0b111,0b100,0b111}, // e=4
-  {0b111,0b100,0b110,0b100,0b100}, // f=5
-  {0b011,0b100,0b101,0b101,0b011}, // g=6
-  {0b101,0b101,0b111,0b101,0b101}, // h=7
-  {0b111,0b010,0b010,0b010,0b111}, // i=8
-  {0b011,0b001,0b001,0b101,0b010}, // j=9
-  {0b101,0b110,0b100,0b110,0b101}, // k=10
-  {0b100,0b100,0b100,0b100,0b111}, // l=11
-  {0b101,0b111,0b101,0b101,0b101}, // m=12
-  {0b110,0b101,0b101,0b101,0b101}, // n=13
-  {0b010,0b101,0b101,0b101,0b010}, // o=14
-  {0b110,0b101,0b110,0b100,0b100}, // p=15
-  {0b010,0b101,0b101,0b011,0b001}, // q=16
-  {0b110,0b101,0b110,0b101,0b101}, // r=17
-  {0b011,0b100,0b010,0b001,0b110}, // s=18
-  {0b111,0b010,0b010,0b010,0b010}, // t=19
-  {0b101,0b101,0b101,0b101,0b011}, // u=20
-  {0b101,0b101,0b101,0b010,0b010}, // v=21
-  {0b101,0b101,0b101,0b111,0b101}, // w=22
-  {0b101,0b010,0b010,0b010,0b101}, // x=23
-  {0b101,0b101,0b010,0b010,0b010}, // y=24
-  {0b111,0b001,0b010,0b100,0b111}, // z=25
-  {0b000,0b000,0b000,0b000,0b000}, // 26=Leer
-  {0b000,0b000,0b111,0b000,0b000}, // 27=-
+  {0b010,0b111,0b101,0b101,0b010}, // a
+  {0b110,0b101,0b110,0b101,0b110}, // b
+  {0b011,0b100,0b100,0b100,0b011}, // c
+  {0b110,0b101,0b101,0b101,0b110}, // d
+  {0b111,0b100,0b111,0b100,0b111}, // e
+  {0b111,0b100,0b110,0b100,0b100}, // f
+  {0b011,0b100,0b101,0b101,0b011}, // g
+  {0b101,0b101,0b111,0b101,0b101}, // h
+  {0b111,0b010,0b010,0b010,0b111}, // i
+  {0b011,0b001,0b001,0b101,0b010}, // j
+  {0b101,0b110,0b100,0b110,0b101}, // k
+  {0b100,0b100,0b100,0b100,0b111}, // l
+  {0b101,0b111,0b101,0b101,0b101}, // m
+  {0b110,0b101,0b101,0b101,0b101}, // n
+  {0b010,0b101,0b101,0b101,0b010}, // o
+  {0b110,0b101,0b110,0b100,0b100}, // p
+  {0b010,0b101,0b101,0b011,0b001}, // q
+  {0b110,0b101,0b110,0b101,0b101}, // r
+  {0b011,0b100,0b010,0b001,0b110}, // s
+  {0b111,0b010,0b010,0b010,0b010}, // t
+  {0b101,0b101,0b101,0b101,0b011}, // u
+  {0b101,0b101,0b101,0b010,0b010}, // v
+  {0b101,0b101,0b101,0b111,0b101}, // w
+  {0b101,0b010,0b010,0b010,0b101}, // x
+  {0b101,0b101,0b010,0b010,0b010}, // y
+  {0b111,0b001,0b010,0b100,0b111}, // z
+  {0b000,0b000,0b000,0b000,0b000}, // space
+  {0b000,0b000,0b111,0b000,0b000}, // -
 };
 
 // =====================================================
 // ZEICHNEN
-// gespiegeltX = WIDTH-1-(x_off+col)  →  Y-Achsen-Spiegelung
 // =====================================================
-
-// Grosses Zeichen (7x5) quer über beide Matrizen
 void drawLargeChar(int x_off, int y_off, uint8_t idx, CRGB color) {
   if (idx > 12) return;
   for (int row = 0; row < 7; row++) {
@@ -165,8 +158,6 @@ void drawLargeChar(int x_off, int y_off, uint8_t idx, CRGB color) {
   }
 }
 
-// Kleines Zeichen (5x3) für scrollenden Wettertext
-// Nur auf der unteren Matrix (y >= HEIGHT), daher y_off >= 8
 void drawSmallChar(int x_off, int y_off, uint8_t idx, CRGB color) {
   if (idx > 27) return;
   for (int row = 0; row < 5; row++) {
@@ -182,7 +173,7 @@ void drawSmallChar(int x_off, int y_off, uint8_t idx, CRGB color) {
 }
 
 // =====================================================
-// TEMPERATUR – 7px hoch, mittig über beide Matrizen (y 4..10)
+// TEMPERATUR
 // =====================================================
 void drawTemperature() {
   uint8_t chars[6]; int len = 0;
@@ -193,24 +184,18 @@ void drawTemperature() {
   chars[len++] = 10; // °
   chars[len++] = 11; // C
 
-  CRGB col;
-  if      (weatherTemp <= 0)  col = CRGB(80,  160, 255);
-  else if (weatherTemp <= 10) col = CRGB(0,   200, 255);
-  else if (weatherTemp <= 20) col = CRGB(0,   220,  80);
-  else if (weatherTemp <= 30) col = CRGB(255, 200,   0);
-  else                        col = CRGB(255,  60,   0);
+  CRGB col = CRGB(255, 255, 255);  // gut sichtbar
 
-  // 5px breit + 1px Abstand pro Zeichen
   int totalW = len * 6 - 1;
   int startX = (MATRIX_WIDTH - totalW) / 2;
-  int startY = (MATRIX_HEIGHT - 7) / 2; // = 4 → y 4..10
+  int startY = 3; // etwas höher, damit unten Platz für Text bleibt
 
   for (int i = 0; i < len; i++)
     drawLargeChar(startX + i * 6, startY, chars[i], col);
 }
 
 // =====================================================
-// WETTERTEXT – scrollend unten (y 10..14)
+// WETTERTEXT
 // =====================================================
 int labelScrollX = MATRIX_WIDTH;
 unsigned long lastLabelStep = 0;
@@ -234,12 +219,12 @@ void drawWeatherLabel() {
                 : (c == '-')             ? 27 : 26;
     int xPos = labelScrollX + i * 4;
     if (xPos > MATRIX_WIDTH || xPos < -3) continue;
-    drawSmallChar(xPos, 10, idx, CRGB(0, 140, 255));
+    drawSmallChar(xPos, 11, idx, CRGB(0, 140, 255)); // unten auf der zweiten Matrix
   }
 }
 
 // =====================================================
-// HINTERGRUND – animiert je nach Wetterlage
+// HINTERGRUND
 // =====================================================
 struct Particle { float x; float y; float speed; };
 Particle particles[20];
@@ -256,8 +241,8 @@ void initParticles() {
 
 void drawBackground() {
   for (int i = 0; i < NUM_LEDS; i++) {
-    leds1[i].fadeToBlackBy(50);
-    leds2[i].fadeToBlackBy(50);
+    leds1[i].fadeToBlackBy(40);
+    leds2[i].fadeToBlackBy(40);
   }
 
   // Regen
@@ -330,12 +315,13 @@ void drawBackground() {
   // Nebel
   else if (weatherCondition >= 700 && weatherCondition < 800) {
     static unsigned long t = 0; t += 2;
-    for (int x=0; x<MATRIX_WIDTH; x++)
+    for (int x=0; x<MATRIX_WIDTH; x++) {
       for (int y=0; y<MATRIX_HEIGHT; y++) {
         uint8_t n = inoise8(x*30, y*30, t);
         uint8_t b = map(n, 0, 255, 8, 45);
         setPixelXY(x, y, CRGB(b,b,b+10));
       }
+    }
   }
 }
 
@@ -350,6 +336,7 @@ void setup() {
   FastLED.clear();
   FastLED.show();
 
+  // kleiner Start-Sweep, um zu sehen, ob alles läuft
   for (int i = 0; i < MATRIX_WIDTH; i++) {
     FastLED.clear();
     for (int y = 0; y < MATRIX_HEIGHT; y++) setPixelXY(i, y, CRGB(0, 0, 60));
@@ -379,6 +366,7 @@ void loop() {
   drawBackground();
   drawTemperature();
   updateLabelScroll();
+  drawWeatherLabel();      // FIX: jetzt wird der Text wirklich gezeichnet
   FastLED.show();
   delay(20);
 }
